@@ -1,2 +1,2 @@
 # coding-agent
-coding agent learn with ts
+coding agent learn with py
