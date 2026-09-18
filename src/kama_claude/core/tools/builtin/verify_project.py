@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from kama_claude.core.sandbox import ExecutionBackend, LocalExecutionBackend
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.verification import (
     VerificationKind,
@@ -76,8 +78,16 @@ class VerifyProjectTool(BaseTool):
     }
 
     # 创建仅允许验证会话工作区子目录的项目验证工具
-    def __init__(self, *, workspace_root: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        workspace_root: str | Path | None = None,
+        execution_backend: ExecutionBackend | None = None,
+        ignore_files: Sequence[str] | None = None,
+    ) -> None:
         self._workspace = WorkspaceBoundary.from_path(workspace_root or Path.cwd())
+        self._execution_backend = execution_backend or LocalExecutionBackend()
+        self._ignore_files = tuple(ignore_files or ())
 
     # 生成验证计划并在明确要求时执行经过审批的项目命令
     async def invoke(self, params: dict[str, object]) -> ToolResult:
@@ -89,6 +99,8 @@ class VerifyProjectTool(BaseTool):
             manager = VerificationManager(
                 root,
                 timeout_seconds=parsed.timeout_seconds,
+                execution_backend=self._execution_backend,
+                sensitive_patterns=self._ignore_files,
             )
             if (
                 parsed.incremental

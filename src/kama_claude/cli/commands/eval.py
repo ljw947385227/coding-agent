@@ -8,7 +8,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from kama_claude.core.config import KamaConfig
-from kama_claude.core.harness import EvaluationHarness, EvaluationResult, EvaluationSuite
+from kama_claude.core.harness import EvaluationResult, EvaluationRunner, EvaluationSuite
 
 
 def cmd_eval(
@@ -18,6 +18,7 @@ def cmd_eval(
     output: str | None,
     repeats: int,
     keep_worktrees: bool,
+    validate_only: bool = False,
 ) -> None:
     path = Path(task_file).expanduser().resolve()
     try:
@@ -27,6 +28,19 @@ def cmd_eval(
         sys.exit(2)
 
     suite = _resolve_repositories(suite, path.parent)
+    if validate_only:
+        print(
+            json.dumps(
+                {
+                    "valid": True,
+                    "tasks": len(suite.tasks),
+                    "task_names": [task.name for task in suite.tasks],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
     output_root = (
         Path(output).expanduser().resolve()
         if output is not None
@@ -65,12 +79,12 @@ async def _run_suite(
     repeats: int,
     keep_worktrees: bool,
 ) -> list[EvaluationResult]:
-    harness = EvaluationHarness(config, output_root=output_root)
+    evaluator = EvaluationRunner(config, output_root=output_root)
     results: list[EvaluationResult] = []
     for repeat in range(1, repeats + 1):
         for task in suite.tasks:
             print(f"[eval] {task.name} repeat={repeat}/{repeats}")
-            result = await harness.run(task, keep_worktree=keep_worktrees)
+            result = await evaluator.run(task, keep_worktree=keep_worktrees)
             results.append(result)
             verification = (
                 "passed" if result.verification_passed else "failed"
@@ -96,18 +110,24 @@ def _summary(results: list[EvaluationResult]) -> dict[str, object]:
     durations = sorted(result.metrics.duration_ms for result in results)
     successful = sum(result.status == "success" for result in results)
     verification_passed = sum(result.verification_passed is True for result in results)
+    scored = [result for result in results if result.score is not None]
+    behavior_passed = sum(result.score is not None and result.score.passed for result in scored)
     return {
         "runs": len(results),
         "successful": successful,
         "success_rate": successful / len(results) if results else 0.0,
         "verification_passed": verification_passed,
         "verification_pass_rate": verification_passed / len(results) if results else 0.0,
+        "behavior_scored": len(scored),
+        "behavior_passed": behavior_passed,
+        "behavior_pass_rate": behavior_passed / len(scored) if scored else None,
         "duration_p50_ms": _percentile(durations, 0.50),
         "duration_p95_ms": _percentile(durations, 0.95),
         "input_tokens": sum(result.metrics.input_tokens for result in results),
         "output_tokens": sum(result.metrics.output_tokens for result in results),
         "tool_calls": sum(result.metrics.tool_calls for result in results),
         "tool_failures": sum(result.metrics.tool_failures for result in results),
+        "sandbox_info_calls": sum(result.metrics.sandbox_info_calls for result in results),
         "results": [result.model_dump(mode="json") for result in results],
     }
 

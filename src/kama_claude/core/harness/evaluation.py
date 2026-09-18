@@ -15,12 +15,16 @@ from kama_claude.core.git.checkpoint import CheckpointManager
 from kama_claude.core.git.process import git_error_message, run_git
 from kama_claude.core.harness.metrics import MetricsCollector
 from kama_claude.core.harness.models import (
+    EvaluationExpectations,
     EvaluationResult,
+    EvaluationSandboxSpec,
+    EvaluationScore,
     EvaluationTask,
 )
 from kama_claude.core.llm.base import LLMProvider
-from kama_claude.core.runner import AgentRunner, RunOutcome
+from kama_claude.core.runner import AgentHarness, RunOutcome
 from kama_claude.core.runs import new_run_id
+from kama_claude.core.sandbox import LocalExecutionBackend, create_execution_backend
 from kama_claude.core.verification.model import (
     VerificationCheck,
     VerificationPlan,
@@ -32,7 +36,7 @@ _PATCH_LIMIT = 8 * 1024 * 1024
 _SAFE_NAME = re.compile(r"[^0-9A-Za-z._-]+")
 
 
-class EvaluationHarness:
+class EvaluationRunner:
     """Run one coding task in an isolated Git worktree and preserve evidence."""
 
     def __init__(
@@ -87,10 +91,12 @@ class EvaluationHarness:
                 config.agent.max_steps = task.max_steps
             if task.model is not None:
                 config.llm.default_model = task.model
+            if task.sandbox is not None:
+                _apply_sandbox_config(config, task.sandbox)
 
             bus = EventBus()
             bus.subscribe(collector.handle)
-            runner = AgentRunner(
+            runner = AgentHarness(
                 config,
                 bus=bus,
                 provider=self._provider,
@@ -127,19 +133,37 @@ class EvaluationHarness:
             result.patch_file = patch_file
             result.patch_truncated = truncated
 
-            report = await _run_oracle(task, worktree)
+            if task.expectations is not None:
+                result.score = _score_expectations(
+                    task.expectations,
+                    result,
+                    collector.tool_calls_by_name,
+                )
+                _write_json(
+                    artifact_dir / "score.json",
+                    result.score.model_dump(mode="json"),
+                )
+            _write_json(artifact_dir / "tool_trace.json", collector.tool_trace)
+
+            report = await _run_oracle(task, worktree, config)
             result.verification_passed = report.passed
             _write_json(artifact_dir / "verification.json", asdict(report))
 
             if result.status != "timeout":
-                if result.agent_status == "success" and report.passed:
+                behavior_passed = result.score is None or result.score.passed
+                if result.agent_status == "success" and report.passed and behavior_passed:
                     result.status = "success"
                     result.reason = None
                 else:
                     result.status = "failed"
-                    result.reason = result.agent_reason or (
-                        "verification_failed" if not report.passed else "agent_failed"
-                    )
+                    if result.agent_reason is not None:
+                        result.reason = result.agent_reason
+                    elif not report.passed:
+                        result.reason = "verification_failed"
+                    elif not behavior_passed:
+                        result.reason = "behavior_expectation_failed"
+                    else:
+                        result.reason = "agent_failed"
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -262,7 +286,11 @@ async def _capture_patch(
     return changed_files, path.as_posix(), False
 
 
-async def _run_oracle(task: EvaluationTask, worktree: Path) -> VerificationReport:
+async def _run_oracle(
+    task: EvaluationTask,
+    worktree: Path,
+    config: KamaConfig,
+) -> VerificationReport:
     checks = tuple(
         VerificationCheck(
             kind=spec.kind,
@@ -278,9 +306,66 @@ async def _run_oracle(task: EvaluationTask, worktree: Path) -> VerificationRepor
         ecosystems=tuple(dict.fromkeys(spec.ecosystem for spec in task.checks)),
         checks=checks,
     )
+    execution_backend = (
+        create_execution_backend(config.execution)
+        if task.oracle_backend == "sandbox"
+        else LocalExecutionBackend()
+    )
     return await VerificationRunner(
         timeout_seconds=task.verification_timeout_seconds,
+        execution_backend=execution_backend,
     ).run(plan)
+
+
+# 将任务级沙箱场景覆盖应用到隔离后的 Harness 配置副本
+def _apply_sandbox_config(config: KamaConfig, sandbox: EvaluationSandboxSpec) -> None:
+    config.execution.backend = sandbox.backend
+    config.execution.docker.network = sandbox.network
+    if sandbox.image is not None:
+        config.execution.docker.image = sandbox.image
+    for field_name in ("memory_mb", "cpus", "pids_limit", "tmpfs_mb"):
+        value = getattr(sandbox, field_name)
+        if value is not None:
+            setattr(config.execution.docker, field_name, value)
+
+
+# 对工具选择、源码修改和最终诊断文本执行可复现的行为评分
+def _score_expectations(
+    expected: EvaluationExpectations,
+    result: EvaluationResult,
+    calls: dict[str, int],
+) -> EvaluationScore:
+    failures: list[str] = []
+    sandbox_calls = calls.get("sandbox_info", 0)
+    if expected.sandbox_info == "required" and sandbox_calls == 0:
+        failures.append("sandbox_info was required but not called")
+    if expected.sandbox_info == "forbidden" and sandbox_calls > 0:
+        failures.append("sandbox_info was forbidden but called")
+    if sandbox_calls > expected.max_sandbox_info_calls:
+        failures.append(
+            f"sandbox_info called {sandbox_calls} times; maximum is "
+            f"{expected.max_sandbox_info_calls}"
+        )
+    if not expected.allow_source_changes and result.changed_files:
+        failures.append("source changes were forbidden: " + ", ".join(result.changed_files))
+    for tool_name in expected.required_tools:
+        if calls.get(tool_name, 0) == 0:
+            failures.append(f"required tool was not called: {tool_name}")
+    for tool_name in expected.forbidden_tools:
+        if calls.get(tool_name, 0) > 0:
+            failures.append(f"forbidden tool was called: {tool_name}")
+    matched: list[str] = []
+    for pattern in expected.answer_patterns:
+        if re.search(pattern, result.answer, re.IGNORECASE | re.MULTILINE) is None:
+            failures.append(f"answer did not match pattern: {pattern}")
+        else:
+            matched.append(pattern)
+    return EvaluationScore(
+        passed=not failures,
+        failures=failures,
+        sandbox_info_calls=sandbox_calls,
+        matched_answer_patterns=matched,
+    )
 
 
 def _safe_name(value: str) -> str:
@@ -305,3 +390,7 @@ def _write_json(path: Path, payload: object) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+# 兼容早期错误命名；新代码应使用 EvaluationRunner，避免与生产 AgentHarness 混淆
+EvaluationHarness = EvaluationRunner

@@ -47,7 +47,7 @@ class TraceConfig:
 
 @dataclass
 class PermissionConfig:
-    timeout_s: float = 60.0  # 审批超时秒数；0 表示不超时
+    timeout_s: float = 0  # 审批超时秒数；0 表示不超时
 
 
 @dataclass
@@ -63,6 +63,24 @@ class VerificationConfig:
     mode: Literal["off", "suggest", "required_on_write"] = "required_on_write"
     max_attempts: int = 3
     max_total_seconds: float = 600.0
+
+
+@dataclass
+class DockerExecutionConfig:
+    cli: str = "docker"
+    image: str = "kama-sandbox-python:3.12-v1"
+    network: Literal["none", "bridge"] = "none"
+    memory_mb: int = 512
+    cpus: float = 1.0
+    pids_limit: int = 64
+    tmpfs_mb: int = 256
+    user: str = "10001:10001"
+
+
+@dataclass
+class ExecutionConfig:
+    backend: Literal["local", "docker"] = "local"
+    docker: DockerExecutionConfig = field(default_factory=DockerExecutionConfig)
 
 
 @dataclass
@@ -106,6 +124,7 @@ class KamaConfig:
     permission: PermissionConfig = field(default_factory=PermissionConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     verification: VerificationConfig = field(default_factory=VerificationConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     runs: RunConfig = field(default_factory=RunConfig)
     files: FileAccessConfig = field(default_factory=FileAccessConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
@@ -152,6 +171,7 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         "permission",
         "compaction",
         "verification",
+        "execution",
         "runs",
         "files",
         "mcp",
@@ -324,6 +344,23 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                     "Config error: verification.max_total_seconds must be a positive number"
                 )
             config.verification.max_total_seconds = float(max_total_seconds)
+
+    if "execution" in data:
+        execution = data["execution"]
+        if not isinstance(execution, dict):
+            raise SystemExit("Config error: [execution] must be a table")
+        unknown_execution = set(execution.keys()) - {"backend", "docker"}
+        if unknown_execution:
+            raise SystemExit(
+                f"Unknown [execution] keys: {', '.join(sorted(unknown_execution))}"
+            )
+        if "backend" in execution:
+            backend = execution["backend"]
+            if backend not in ("local", "docker"):
+                raise SystemExit("Config error: execution.backend must be local or docker")
+            config.execution.backend = backend
+        if "docker" in execution:
+            _apply_docker_toml(config.execution.docker, execution["docker"])
 
     if "runs" in data:
         runs = data["runs"]
@@ -562,6 +599,57 @@ def _apply_env(config: KamaConfig) -> None:
                 "Config error: KAMA_VERIFICATION_MAX_TOTAL_SECONDS must be a positive number"
             )
 
+    execution_backend = os.environ.get("KAMA_EXECUTION_BACKEND")
+    if execution_backend is not None:
+        if execution_backend not in ("local", "docker"):
+            raise SystemExit("Config error: KAMA_EXECUTION_BACKEND must be local or docker")
+        config.execution.backend = cast(Literal["local", "docker"], execution_backend)
+
+    docker_string_env = {
+        "KAMA_DOCKER_CLI": "cli",
+        "KAMA_DOCKER_IMAGE": "image",
+        "KAMA_DOCKER_USER": "user",
+    }
+    for env_name, field_name in docker_string_env.items():
+        raw = os.environ.get(env_name)
+        if raw is not None:
+            if not raw:
+                raise SystemExit(f"Config error: {env_name} must not be empty")
+            setattr(config.execution.docker, field_name, raw)
+
+    docker_network = os.environ.get("KAMA_DOCKER_NETWORK")
+    if docker_network is not None:
+        if docker_network not in ("none", "bridge"):
+            raise SystemExit("Config error: KAMA_DOCKER_NETWORK must be none or bridge")
+        config.execution.docker.network = cast(Literal["none", "bridge"], docker_network)
+
+    docker_int_env = {
+        "KAMA_DOCKER_MEMORY_MB": "memory_mb",
+        "KAMA_DOCKER_PIDS_LIMIT": "pids_limit",
+        "KAMA_DOCKER_TMPFS_MB": "tmpfs_mb",
+    }
+    for env_name, field_name in docker_int_env.items():
+        raw = os.environ.get(env_name)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+            if value <= 0:
+                raise ValueError
+        except ValueError:
+            raise SystemExit(f"Config error: {env_name} must be a positive integer")
+        setattr(config.execution.docker, field_name, value)
+
+    docker_cpus = os.environ.get("KAMA_DOCKER_CPUS")
+    if docker_cpus is not None:
+        try:
+            cpus = float(docker_cpus)
+            if cpus <= 0:
+                raise ValueError
+        except ValueError:
+            raise SystemExit("Config error: KAMA_DOCKER_CPUS must be a positive number")
+        config.execution.docker.cpus = cpus
+
     run_env = {
         "KAMA_RUN_SLOW_SECONDS": "slow_run_seconds",
         "KAMA_RUN_STALLED_SECONDS": "stalled_seconds",
@@ -574,12 +662,12 @@ def _apply_env(config: KamaConfig) -> None:
         if raw is None:
             continue
         try:
-            value = float(raw)
-            if value <= 0:
+            run_value = float(raw)
+            if run_value <= 0:
                 raise ValueError
         except ValueError:
             raise SystemExit(f"Config error: {env_name} must be a positive number")
-        setattr(config.runs, field_name, value)
+        setattr(config.runs, field_name, run_value)
 
     ignore_file = os.environ.get("KAMA_IGNORE_FILE")
     if ignore_file is None:
@@ -619,3 +707,48 @@ def _merge_ignore_files(existing: list[str], additions: list[str]) -> list[str]:
         if normalized and normalized not in merged:
             merged.append(normalized)
     return merged
+
+
+# 将 [execution.docker] 严格解析到 Docker 执行配置
+def _apply_docker_toml(config: DockerExecutionConfig, raw: object) -> None:
+    if not isinstance(raw, dict):
+        raise SystemExit("Config error: [execution.docker] must be a table")
+    allowed = {
+        "cli",
+        "image",
+        "network",
+        "memory_mb",
+        "cpus",
+        "pids_limit",
+        "tmpfs_mb",
+        "user",
+    }
+    unknown = set(raw.keys()) - allowed
+    if unknown:
+        raise SystemExit(f"Unknown [execution.docker] keys: {', '.join(sorted(unknown))}")
+    for key in ("cli", "image", "user"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if not isinstance(value, str) or not value:
+            raise SystemExit(f"Config error: execution.docker.{key} must be a non-empty string")
+        setattr(config, key, value)
+    if "network" in raw:
+        network = raw["network"]
+        if network not in ("none", "bridge"):
+            raise SystemExit("Config error: execution.docker.network must be none or bridge")
+        config.network = network
+    for key in ("memory_mb", "pids_limit", "tmpfs_mb"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if not isinstance(value, int) or value <= 0:
+            raise SystemExit(
+                f"Config error: execution.docker.{key} must be a positive integer"
+            )
+        setattr(config, key, value)
+    if "cpus" in raw:
+        cpus = raw["cpus"]
+        if not isinstance(cpus, (int, float)) or cpus <= 0:
+            raise SystemExit("Config error: execution.docker.cpus must be a positive number")
+        config.cpus = float(cpus)

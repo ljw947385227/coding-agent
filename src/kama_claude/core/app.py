@@ -49,6 +49,7 @@ from kama_claude.core.bus.commands import (
 from kama_claude.core.bus.envelope import EventPushEnvelope, HandlerError
 from kama_claude.core.config import KamaConfig, get_config
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.harness import AgentHarness
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.provider import AnthropicProvider
 from kama_claude.core.logging_setup import setup_logging
@@ -56,7 +57,6 @@ from kama_claude.core.mcp.server import McpServerManager
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.storage import load_policy_file
 from kama_claude.core.run_manager import RunManager
-from kama_claude.core.runner import AgentRunner
 from kama_claude.core.runs import events_file, new_run_id
 from kama_claude.core.session import (
     SessionManager,
@@ -155,7 +155,7 @@ class CoreApp:
             )
         )
 
-    # 启动一次 agent run：异步创建 AgentRunner 并立即返回 run_id
+    # 启动一次 agent run：异步交给生产 AgentHarness 并立即返回 run_id
     async def _agent_run_handler(self, params: dict[str, Any]) -> AgentRunResult:
         assert self._sessions is not None
         cmd = AgentRunCommand.model_validate(params)
@@ -425,7 +425,7 @@ class CoreApp:
 
         self._sessions = SessionManager(
             store,
-            runner_factory=lambda: AgentRunner(
+            runner_factory=lambda: AgentHarness(
                 self._config,  # type: ignore[arg-type]
                 bus=self._bus,
                 provider=self._runner_provider,

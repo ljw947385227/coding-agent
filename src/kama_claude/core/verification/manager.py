@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
+from kama_claude.core.sandbox import ExecutionBackend
 from kama_claude.core.verification.detector import discover_verification_plan
 from kama_claude.core.verification.model import (
     VerificationCheck,
@@ -23,11 +24,15 @@ class VerificationManager:
         *,
         timeout_seconds: float = 120.0,
         max_output_bytes: int = 32 * 1024,
+        execution_backend: ExecutionBackend | None = None,
+        sensitive_patterns: Sequence[str] | None = None,
     ) -> None:
         self._root = root.resolve()
         self._runner = VerificationRunner(
             timeout_seconds=timeout_seconds,
             max_output_bytes=max_output_bytes,
+            execution_backend=execution_backend,
+            sensitive_patterns=tuple(sensitive_patterns or ()),
         )
 
     # 探测项目生态并生成可审查的验证计划

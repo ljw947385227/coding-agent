@@ -21,6 +21,11 @@ from kama_claude.core.memory.loader import load_context_file
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.run_manager import RunManager
 from kama_claude.core.runs import RUNS_DIR, new_run_id
+from kama_claude.core.sandbox import (
+    ExecutionBackend,
+    create_execution_backend,
+    sandbox_system_prompt,
+)
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
@@ -36,6 +41,7 @@ from kama_claude.core.tools.builtin import (
     ListDirTool,
     NoteSaveTool,
     ReadFileTool,
+    SandboxInfoTool,
     SearchCodeTool,
     TaskCreateTool,
     TaskGetTool,
@@ -62,7 +68,9 @@ class RunOutcome:
     reason: str | None
 
 
-class AgentRunner:
+class AgentHarness:
+    """组装并驱动一次完整 Agent 生命周期的生产运行 Harness。"""
+
     # 组装所有运行时依赖，准备执行一次完整的 agent run
     def __init__(
         self,
@@ -76,6 +84,7 @@ class AgentRunner:
         permission_manager: PermissionManager | None = None,
         mcp_manager: McpServerManager | None = None,
         run_manager: RunManager | None = None,
+        execution_backend: ExecutionBackend | None = None,
     ) -> None:
         self._config = config
         self._bus = bus
@@ -86,6 +95,7 @@ class AgentRunner:
         self._permission_manager = permission_manager
         self._mcp_manager = mcp_manager
         self._run_manager = run_manager
+        self._execution_backend = execution_backend or create_execution_backend(config.execution)
         # 跨 run 共享的后台 subagent 任务注册表
         self._task_registry = BackgroundTaskRegistry()
 
@@ -136,10 +146,23 @@ class AgentRunner:
                 run_id=run_id,
                 workspace_root=effective_workspace_root,
             ),
+            SandboxInfoTool(
+                self._config.execution,
+                self._execution_backend,
+                effective_workspace_root,
+            ),
             GitRollbackTool(workspace_root=effective_workspace_root),
-            VerifyProjectTool(workspace_root=effective_workspace_root),
+            VerifyProjectTool(
+                workspace_root=effective_workspace_root,
+                execution_backend=self._execution_backend,
+                ignore_files=self._config.files.ignore_files,
+            ),
             EditFileTool(workspace_root=effective_workspace_root),
-            BashTool(workspace_root=effective_workspace_root),
+            BashTool(
+                workspace_root=effective_workspace_root,
+                execution_backend=self._execution_backend,
+                ignore_files=self._config.files.ignore_files,
+            ),
             WriteFileTool(workspace_root=effective_workspace_root),
             ListDirTool(workspace_root=effective_workspace_root),
         ]:
@@ -179,6 +202,8 @@ class AgentRunner:
                             self._config.verification.max_total_seconds
                         ),
                         run_manager=self._run_manager,
+                        execution_backend=self._execution_backend,
+                        execution_config=self._config.execution,
                     )
                 )
             if _ok("agent_result"):
@@ -243,6 +268,10 @@ class AgentRunner:
             session_notes=notes,
             global_context=global_ctx,
             project_context=project_ctx,
+            runtime_context=sandbox_system_prompt(
+                self._config.execution,
+                effective_workspace_root,
+            ),
             system_prompt_override=system_prompt_override,
         )
         if session is not None and store is not None:
@@ -364,3 +393,7 @@ class AgentRunner:
             result=context.result,
             reason=context.reason,
         )
+
+
+# 保留旧名称，避免外部调用方在迁移到 AgentHarness 时立即中断
+AgentRunner = AgentHarness

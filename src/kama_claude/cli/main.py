@@ -61,6 +61,11 @@ def main() -> None:
         action="store_true",
         help="Keep isolated worktrees after evaluation for debugging",
     )
+    eval_parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate and resolve the suite without calling a model",
+    )
 
     core_parser = subparsers.add_parser("core", help="Manage the core daemon")
     core_sub = core_parser.add_subparsers(dest="core_command")
@@ -82,7 +87,8 @@ def main() -> None:
         return
 
     config = get_config()
-    setup_logging(config)
+    if not (args.command == "eval" and args.validate_only):
+        setup_logging(config)
 
     if args.command == "ping":
         cmd_ping(config)
@@ -97,6 +103,7 @@ def main() -> None:
             output=args.output,
             repeats=args.repeats,
             keep_worktrees=args.keep_worktrees,
+            validate_only=args.validate_only,
         )
     elif args.command == "resume":
         cmd_resume(config, args.session_id)

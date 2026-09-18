@@ -25,6 +25,29 @@ class EvaluationCheckSpec(BaseModel):
         return value
 
 
+class EvaluationSandboxSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    backend: Literal["local", "docker"] = "local"
+    image: str | None = None
+    network: Literal["none", "bridge"] = "none"
+    memory_mb: int | None = Field(default=None, gt=0)
+    cpus: float | None = Field(default=None, gt=0)
+    pids_limit: int | None = Field(default=None, gt=0)
+    tmpfs_mb: int | None = Field(default=None, gt=0)
+
+
+class EvaluationExpectations(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sandbox_info: Literal["required", "forbidden", "optional"] = "optional"
+    max_sandbox_info_calls: int = Field(default=1, ge=0)
+    allow_source_changes: bool = True
+    required_tools: list[str] = Field(default_factory=list)
+    forbidden_tools: list[str] = Field(default_factory=list)
+    answer_patterns: list[str] = Field(default_factory=list)
+
+
 class EvaluationTask(BaseModel):
     """A reproducible coding-agent task pinned to a Git revision."""
 
@@ -41,6 +64,9 @@ class EvaluationTask(BaseModel):
     model: str | None = None
     system_prompt: str | None = None
     tool_whitelist: list[str] | None = None
+    sandbox: EvaluationSandboxSpec | None = None
+    oracle_backend: Literal["local", "sandbox"] = "local"
+    expectations: EvaluationExpectations | None = None
 
 
 class EvaluationSuite(BaseModel):
@@ -59,6 +85,15 @@ class EvaluationMetrics(BaseModel):
     output_tokens: int = 0
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
+    sandbox_info_calls: int = 0
+    tool_calls_by_name: dict[str, int] = Field(default_factory=dict)
+
+
+class EvaluationScore(BaseModel):
+    passed: bool
+    failures: list[str] = Field(default_factory=list)
+    sandbox_info_calls: int = 0
+    matched_answer_patterns: list[str] = Field(default_factory=list)
 
 
 class EvaluationResult(BaseModel):
@@ -83,3 +118,4 @@ class EvaluationResult(BaseModel):
     patch_truncated: bool = False
     artifact_dir: str
     metrics: EvaluationMetrics = Field(default_factory=EvaluationMetrics)
+    score: EvaluationScore | None = None

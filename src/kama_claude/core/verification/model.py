@@ -94,6 +94,7 @@ class VerificationResult:
     output: str = ""
     output_truncated: bool = False
     diagnostics: tuple[Diagnostic, ...] = ()
+    environment_hint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

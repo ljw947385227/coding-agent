@@ -1,7 +1,7 @@
 # KamaClaude Coding Agent 演进与量化优化路线
 
 > 文档状态：持续维护  
-> 最近更新：2026-09-17  
+> 最近更新：2026-09-18
 > 目的：统一记录 KamaClaude 向 Coding Agent 演进过程中的现状、设计决策、实施路线、评测方法和简历素材。
 
 ## 1. 项目定位
@@ -265,10 +265,37 @@ search_code → read_file → edit_file → bash/test
 - 验证状态目前只存在于单次 Run 内，尚未跨 Run/重启持久化，也没有独立 token 预算；
 - 模型的 `end_turn` 文本会先流式送达客户端，再由完成门禁决定是否继续修复，后续需要增加“验证后再确认最终答复”的 UI 状态；
 - 项目自定义命令仍依赖标准清单和脚本名，暂不解析自然语言项目指令；
-- 超时会终止直接子进程，但跨平台进程组和孙进程清理仍需统一 Sandbox 支持；
+- 本地与 Docker 执行后端均统一处理超时和进程/容器清理；Docker 模式还提供资源与网络硬边界；
 - 报告目前通过 tool result/Event 进入 run 记录，尚无独立历史索引和 TUI 面板。
 
-### 2.7 Workspace Session Resume 与路径边界
+### 2.7 Docker Execution Sandbox
+
+当前已经加入可替换的 `ExecutionBackend`，并将 `bash` 与 `verify_project(run=true)` 统一接入：
+
+- 默认 `local` 后端保持现有跨平台行为；配置 `execution.backend = "docker"` 后，根 Agent、子 Agent 和自动验证共用 Docker 后端；
+- 每次命令使用独立的一次性容器，执行结束、超时或任务取消后都执行强制删除；
+- Docker 安全参数由 Runtime 固定生成，模型不能覆盖：默认 `--network none`、只读根文件系统、非 root 用户、`cap-drop ALL`、`no-new-privileges`、PID/内存/CPU/tmpfs 上限；
+- 当前 Session 工作区以读写 bind mount 暴露为 `/workspace`，因而 Agent 修改仍直接落到当前 worktree；环境依赖来自镜像，不会自动把宿主 `.venv` 搬入 Linux 容器；
+- `.git`、`.venv`、`.env`、`.env.*`、私钥、`secrets.json` 以及用户 `ignore_file` 命中的实际路径会被空的只读 bind mount 覆盖；Git checkpoint/rollback 仍由宿主结构化工具负责；
+- Docker 容器不继承 daemon 宿主环境，只注入固定运行变量与请求显式声明的最小环境；
+- 宿主 Docker CLI 始终通过 argv 调用，沙箱内 shell 只解释模型本来要执行的 Bash 命令；
+- stdout/stderr 采用有界头尾保留；结构化结果区分启动失败、超时、OOM、非零退出与清理失败；
+- 每次 Run 自动注入低成本执行环境摘要；根 Agent、Planner、Executor、Reviewer 和嵌套子 Agent 都可调用无需审批的只读 `sandbox_info`；
+- `sandbox_info` 同时返回脱敏宿主摘要、容器实际 OS/架构/UID/Python/工具可用性、镜像 ID、Kama 标签和依赖输入指纹，不读取或返回宿主环境变量；
+- 项目镜像可用 `kama.environment-fingerprint` 标签绑定 Dockerfile、包清单和 lockfile 指纹；不带标签的基础镜像明确返回 drift unknown，避免误报“环境最新”；
+- Bash 与 Verification 只在缺命令/依赖、权限、网络、架构、启动失败或 OOM 等证据出现时附加环境提示，普通 assertion、语法、lint 和类型错误不会触发；
+- 提供离线可构建的 `python:3.12-slim` 基础镜像，以及需要构建阶段联网、预装 Git/Ripgrep/项目和测试工具的项目镜像；
+- 真实 Docker 集成测试已验证：工作区写入、敏感文件遮蔽、UID 10001、默认断网、只读根、超时后无容器残留，以及 Windows 宿主与 Linux Sandbox 的实际信息区分。
+
+当前边界：
+
+- Docker Desktop 本机必须已经启动；项目依赖必须烘焙进自定义镜像，基础镜像只保证 Python 标准库；
+- 当前工作区整体仍以读写方式挂载，未进一步拆分为只读源码层与显式输出层；
+- `network=bridge` 只有全开/全关，没有域名 allowlist、代理审计或 egress 记录；
+- 尚未实现镜像 digest 强制锁定、镜像漏洞扫描、磁盘配额、容器池和远程 sandbox provider；
+- MCP 与其他外部集成仍在 daemon 侧运行，不经过命令执行沙箱。
+
+### 2.8 Workspace Session Resume 与路径边界
 
 当前会话工作区由客户端启动目录确定，而不是 daemon 的常驻目录：
 
@@ -289,7 +316,7 @@ WorkspaceBoundary.resolve(path)
 - 绝对路径只有在工作区内部才允许；
 - 真实路径解析后再次检查边界，因此工作区内指向外部的符号链接无法逃逸；
 - `read_file`、`write_file`、`edit_file`、`list_dir`、`search_code`、Git 和 Verification 工具共用同一边界；
-- Bash 子进程的 `cwd` 固定为工作区，但完整读写隔离仍依赖后续 OS 级 sandbox；
+- Bash 的 `cwd` 固定为工作区；启用 Docker backend 时，宿主文件访问被限制到显式挂载的工作区和敏感路径遮蔽规则；
 - 根 Agent 与子 Agent 共享同一工作区边界；
 - Git 仓库根也必须在工作区内，避免从嵌套目录访问上级仓库的其他文件；
 - 历史旧 Session 没有可靠的 cwd 信息，不会自动混入任意工作区列表；知道 ID 时可首次绑定当前工作区。
@@ -303,22 +330,33 @@ WorkspaceBoundary.resolve(path)
 5. 旧版 `closed` chat 显式恢复为 `waiting_for_input`，one-shot 任务不可恢复；
 6. 后续每个 Run 继续使用 Session 中已持久化的工作区。
 
-### 2.8 Agent Evaluation Harness
+### 2.9 Production Agent Harness 与 Evaluator
+
+生产 Harness 入口现为 `AgentHarness`：它统一组装 Session、上下文、AgentLoop、工具、
+权限、Sandbox、压缩、验证和子 Agent。Core daemon 实际通过该入口创建运行时；旧名称
+`AgentRunner` 只是兼容别名。具体边界见 `AGENT_HARNESS.md`。
+
+与生产 Harness 分离的 `EvaluationRunner` 负责可复现评测：
 
 当前已加入面向真实 Coding Agent 任务的可复现评测入口：
 
 - `kama eval <suite.json> --repeats N` 按任务矩阵串行执行并生成汇总报告；
 - 每次运行固定 `base_ref` 对应 commit，在系统临时目录创建 detached Git worktree，原工作区不接收 Agent 修改；
-- Agent 使用现有 `AgentRunner`、工具、自动验证和事件链路，Harness 额外执行任务定义中的无 shell oracle；
+- Agent 使用生产 `AgentHarness`、工具、自动验证和事件链路，Evaluator 额外执行任务定义中的无 shell oracle；
 - 任务支持模型、最大步骤、工具白名单、Agent 总超时和单项验证超时；
 - EventBus 聚合步骤、工具调用/失败、权限请求、输入/输出/cache Token 和总耗时；
 - 使用有界 Git tree 快照捕获 tracked/untracked 变化，并保存二进制 patch 和 changed files；
 - 每次运行保存 request、result、metrics、verification、events 和 patch，suite 汇总成功率、验证通过率及耗时 p50/p95；
 - 正常、失败和超时路径都会回收 worktree，显式 `--keep-worktrees` 才保留调试现场；
 - 评测运行不创建用户 Session，不进入 `/resume` 列表；默认关闭不可复现的全局 `~/.kama/context.md` 注入，但保留仓库内 `.kama/context.md`；
-- 当前隔离边界是 Git worktree，不是 OS sandbox；Bash 仍需后续执行后端限制文件系统、网络和资源。
+- Evaluator 当前仍默认沿用 local backend；切换 Docker backend 后可复用相同命令隔离，但仍需为评测依赖准备固定镜像。
+- Task 新增 `sandbox` 场景覆盖和独立 `oracle_backend`：被测 Agent 可运行在 Docker 故障场景中，而默认 Oracle 保持宿主可信执行，避免被测环境同时污染评分器；
+- `expectations` 可以要求或禁止 `sandbox_info`、限制调用次数、禁止源码修改、约束 required/forbidden tools，并用正则检查最终环境诊断；
+- Evaluator 保存无工具输出载荷的 `tool_trace.json`、行为 `score.json` 和 per-tool metrics，行为不达标会使任务失败并让 CLI 返回非零；
+- Suite 汇总新增 behavior pass rate 与 `sandbox_info` 调用总数；`--validate-only` 可在不调用模型、不创建 worktree 时验证任务契约；
+- 已提供环境缺少 pytest 与普通 assertion 的正负对照 suite，但尚未运行真实模型矩阵，因此仍不报告 Sandbox 诊断准确率。
 
-### 2.9 当前代码实现导航
+### 2.10 当前代码实现导航
 
 下表按能力列出主要实现入口和对应测试。阅读时建议先看“入口”，再顺着 import 和调用关系进入“核心实现”。
 
@@ -326,6 +364,7 @@ WorkspaceBoundary.resolve(path)
 |---|---|---|
 | Core 启动与依赖组装 | [`src/kama_claude/core/app.py`](src/kama_claude/core/app.py) | [`tests/unit/test_core_app_signals.py`](tests/unit/test_core_app_signals.py)、集成测试位于 `tests/integration/` |
 | Agent Run 依赖和工具注册 | [`src/kama_claude/core/runner.py`](src/kama_claude/core/runner.py) | [`tests/unit/test_runner.py`](tests/unit/test_runner.py) |
+| Local/Docker 命令执行沙箱与环境感知 | [`src/kama_claude/core/sandbox/`](src/kama_claude/core/sandbox/)、[`src/kama_claude/core/tools/builtin/sandbox_info.py`](src/kama_claude/core/tools/builtin/sandbox_info.py)、[`docker/sandbox/`](docker/sandbox/)、[`src/kama_claude/core/config.py`](src/kama_claude/core/config.py) | [`tests/unit/test_sandbox.py`](tests/unit/test_sandbox.py)、[`tests/integration/test_sandbox_docker.py`](tests/integration/test_sandbox_docker.py)、[`tests/unit/test_config_env.py`](tests/unit/test_config_env.py) |
 | Run 注册、监控与取消 | [`src/kama_claude/core/run_manager.py`](src/kama_claude/core/run_manager.py)、[`src/kama_claude/core/app.py`](src/kama_claude/core/app.py)、[`src/kama_claude/core/bus/commands.py`](src/kama_claude/core/bus/commands.py)、[`src/kama_claude/core/bus/events.py`](src/kama_claude/core/bus/events.py)、[`src/kama_claude/tui/app.py`](src/kama_claude/tui/app.py) | [`tests/unit/test_run_manager.py`](tests/unit/test_run_manager.py)、[`tests/unit/test_tui_app.py`](tests/unit/test_tui_app.py)、[`tests/unit/test_commands_events.py`](tests/unit/test_commands_events.py) |
 | Agent 主循环 | [`src/kama_claude/core/loop.py`](src/kama_claude/core/loop.py) | [`tests/unit/test_loop.py`](tests/unit/test_loop.py) |
 | 单次执行上下文和待持久化消息 | [`src/kama_claude/core/context.py`](src/kama_claude/core/context.py) | [`tests/unit/test_context.py`](tests/unit/test_context.py)、[`tests/unit/test_context_system_prompt.py`](tests/unit/test_context_system_prompt.py) |
@@ -351,7 +390,8 @@ WorkspaceBoundary.resolve(path)
 | 自动验证完成门禁与有界修复循环 | [`src/kama_claude/core/verification/controller.py`](src/kama_claude/core/verification/controller.py)、[`src/kama_claude/core/loop.py`](src/kama_claude/core/loop.py)、[`src/kama_claude/core/runner.py`](src/kama_claude/core/runner.py)、[`src/kama_claude/core/config.py`](src/kama_claude/core/config.py) | [`tests/unit/test_verification_controller.py`](tests/unit/test_verification_controller.py)、[`tests/unit/test_config_env.py`](tests/unit/test_config_env.py)、[`tests/integration/test_verification_auto_loop.py`](tests/integration/test_verification_auto_loop.py) |
 | 持久化测试结构索引与增量 pytest 选择 | [`src/kama_claude/core/verification/test_index.py`](src/kama_claude/core/verification/test_index.py)、[`src/kama_claude/core/verification/semantic/diff_analyzer.py`](src/kama_claude/core/verification/semantic/diff_analyzer.py)、[`src/kama_claude/core/verification/semantic/python_parser.py`](src/kama_claude/core/verification/semantic/python_parser.py)、[`src/kama_claude/core/verification/semantic/classifier.py`](src/kama_claude/core/verification/semantic/classifier.py)、[`src/kama_claude/core/verification/manager.py`](src/kama_claude/core/verification/manager.py)、[`src/kama_claude/core/git/checkpoint.py`](src/kama_claude/core/git/checkpoint.py)、[`src/kama_claude/core/tools/builtin/verify_project.py`](src/kama_claude/core/tools/builtin/verify_project.py)、[`src/kama_claude/core/session/manager.py`](src/kama_claude/core/session/manager.py)、[`src/kama_claude/tui/app.py`](src/kama_claude/tui/app.py) | [`tests/unit/test_verification_test_index.py`](tests/unit/test_verification_test_index.py)、[`tests/unit/test_semantic_diff.py`](tests/unit/test_semantic_diff.py)、[`tests/integration/test_verification_auto_loop.py`](tests/integration/test_verification_auto_loop.py)、[`tests/unit/test_tui_app.py`](tests/unit/test_tui_app.py) |
 | 增量 pytest mutation 评测 | [`benchmarks/benchmark_incremental_tests.py`](benchmarks/benchmark_incremental_tests.py)、[`benchmarks/incremental_tests/pytest_recorder.py`](benchmarks/incremental_tests/pytest_recorder.py)、[`benchmarks/incremental_tests/coverage_exporter.py`](benchmarks/incremental_tests/coverage_exporter.py)、[`benchmarks/results/incremental_tests_windows_20_2026-09-16.json`](benchmarks/results/incremental_tests_windows_20_2026-09-16.json)、[`benchmarks/results/incremental_tests_coverage_4case_2026-09-16.json`](benchmarks/results/incremental_tests_coverage_4case_2026-09-16.json) | [`tests/unit/test_incremental_benchmark.py`](tests/unit/test_incremental_benchmark.py)、[`tests/unit/test_verification_test_index.py`](tests/unit/test_verification_test_index.py) |
-| Agent Evaluation Harness | [`src/kama_claude/core/harness/`](src/kama_claude/core/harness/)、[`src/kama_claude/cli/commands/eval.py`](src/kama_claude/cli/commands/eval.py)、[`examples/evaluation_suite.example.json`](examples/evaluation_suite.example.json) | [`tests/unit/test_evaluation_harness.py`](tests/unit/test_evaluation_harness.py) |
+| Production Agent Harness | [`src/kama_claude/core/runner.py`](src/kama_claude/core/runner.py)、[`AGENT_HARNESS.md`](AGENT_HARNESS.md) | [`tests/unit/test_evaluation_harness.py`](tests/unit/test_evaluation_harness.py) 的公开入口兼容性测试及各运行子系统测试 |
+| Agent Evaluator | [`src/kama_claude/core/harness/evaluation.py`](src/kama_claude/core/harness/evaluation.py)、[`src/kama_claude/cli/commands/eval.py`](src/kama_claude/cli/commands/eval.py)、[`EVALUATION_HARNESS.md`](EVALUATION_HARNESS.md)、[`examples/sandbox_diagnosis_suite.example.json`](examples/sandbox_diagnosis_suite.example.json) | [`tests/unit/test_evaluation_harness.py`](tests/unit/test_evaluation_harness.py) |
 | 测试日志数据生成与 Parser 评测 | [`benchmarks/generate_test_log_dataset.py`](benchmarks/generate_test_log_dataset.py)、[`benchmarks/datasets/test_logs_v1/summary.json`](benchmarks/datasets/test_logs_v1/summary.json)、[`benchmarks/results/test_log_parser_windows_100_2026-09-15.json`](benchmarks/results/test_log_parser_windows_100_2026-09-15.json) | [`tests/unit/test_test_log_dataset.py`](tests/unit/test_test_log_dataset.py)、[`tests/unit/test_verification_parser.py`](tests/unit/test_verification_parser.py) |
 | 其他内置文件和 Bash 工具 | [`src/kama_claude/core/tools/builtin/`](src/kama_claude/core/tools/builtin/) | [`tests/unit/test_builtin_tools.py`](tests/unit/test_builtin_tools.py)、[`tests/unit/test_read_file.py`](tests/unit/test_read_file.py) |
 | 权限决策和持久化 | [`src/kama_claude/core/permissions/manager.py`](src/kama_claude/core/permissions/manager.py)、[`src/kama_claude/core/permissions/policy.py`](src/kama_claude/core/permissions/policy.py)、[`src/kama_claude/core/permissions/storage.py`](src/kama_claude/core/permissions/storage.py) | [`tests/unit/test_permission_manager.py`](tests/unit/test_permission_manager.py)、[`tests/unit/test_permission_policy.py`](tests/unit/test_permission_policy.py) |
@@ -377,13 +417,13 @@ WorkspaceBoundary.resolve(path)
 | Checkpoint/rollback | 写后状态点、Git ref 保留、只读 Bash 跳过、LFS 前预算和进程树取消已完成 | 增加列表/TUI、保留期限和清理策略 |
 | Worktree 隔离 | Session 历史分支已使用独立 worktree | 扩展到并发子 Agent、生命周期清理和容量配额 |
 | 自动验证与修复 | 项目识别、失败解析、受控评测、有界修复循环、Git/Python 静态和语义测试选择已完成；4 项目 20 mutation 初测完成 | 收益门禁、真实 CI 留出集、coverage 关系、其他生态、跨 Run 状态与独立 token 预算 |
-| Agent Evaluation Harness | 基础版已完成：固定 commit、隔离 worktree、外部 oracle、patch/事件/指标与 suite 汇总 | 并行调度、环境镜像、随机种子、模型矩阵、OS sandbox 和 Web/TUI 报告 |
+| Agent Evaluator | 可执行基础版已完成：固定 commit、隔离 worktree、独立 Oracle、Sandbox 场景、行为评分、patch/事件/指标与 suite 汇总 | 运行真实模型矩阵、扩展 held-out 任务、并行调度、随机种子和 Web/TUI 报告 |
 | 项目指令发现 | 部分支持 `.kama/context.md` | 用户/项目/子目录分层规则和惰性加载 |
 | 长会话恢复 | Daemon 启动恢复、状态迁移、消息级落盘和损坏隔离已完成 | 诊断/修复 API、偏移索引 |
 | 消息实时持久化 | assistant/tool/compact 逻辑节点已实时追加 | 流式 assistant 草稿与故障注入压测 |
 | Context 预算 | 支持 compact | 调用模型前预检与模型输入投影 |
 | 权限审批 | 已有 | 与 OS sandbox、域名白名单结合 |
-| OS 级 Sandbox | 未实现 | 文件系统、网络和资源强制隔离 |
+| OS 级 Sandbox | Docker MVP 已完成：一次性容器、强制边界、`sandbox_info`、环境摘要、指纹漂移和证据驱动失败提示 | 依赖镜像锁定、只读源码/输出分层、网络 allowlist、磁盘配额、受控 rebuild 和远程 provider |
 | Hooks | 只有内部 EventBus | 可阻断、修改和扩展的生命周期 Hooks |
 | Run/子 Agent 生命周期 | 统一 run_id 注册、查询、顶层/子 Agent 级联取消、慢任务提醒已完成 | 跨重启持久化、并发限制、历史状态索引 |
 | Parallel Tool Calls | 模型可返回多个，当前顺序执行 | 只读并行、写操作串行、依赖调度 |
@@ -411,7 +451,7 @@ WorkspaceBoundary.resolve(path)
 | Git status/diff（已完成） | `core/runner.py`、权限策略、子 Agent 和角色配置 | 已新增 `core/tools/builtin/git_status.py`、`git_diff.py`、`_git.py` | 已覆盖 dirty/untracked/rename/staged/binary/输出上限/非仓库 |
 | Checkpoint/rollback（基础版已完成） | `core/runner.py`、权限策略；后续接 Session/TUI | 已新增 `core/git/checkpoint.py`、`git_checkpoint.py`、`git_rollback.py` | 已覆盖用户混合修改、精确恢复、undo、过期令牌、HEAD 变化；待补 GC 与故障注入 |
 | VerificationManager、有界修复与增量 pytest（基础版已完成） | `core/runner.py`、`core/loop.py`、`core/config.py`、`core/git/checkpoint.py`、权限策略和 Agent Profile | 已新增 `core/verification/test_index.py`、`semantic/` parser 层、`controller.py`、`parser.py` 和 `verify_project.py` | 已覆盖任务前 checkpoint、离线索引刷新、直接/传递 import、Python 函数体语义缩小、全量降级、失败修复重试和完成门禁；待补 coverage、其他生态、选择器 benchmark 和独立 token 预算 |
-| OS Sandbox | `core/tools/invocation.py`、权限配置 | 新增 `core/sandbox/` | 文件越界、网络访问、子进程继承、资源上限 |
+| OS Sandbox（Docker MVP 已完成） | `core/runner.py`、`core/config.py`、`core/tools/builtin/bash.py`、`core/verification/runner.py` | 已新增 `core/sandbox/`、`docker/sandbox/` | 已覆盖安全 argv、敏感路径、超时/输出和真实断网/只读根/清理；待补镜像 digest、磁盘配额、allowlist 和远程 provider |
 | 生命周期 Hooks | `core/events/bus.py`、`core/tools/invocation.py`、Session/Compactor | 新增 `core/hooks/` | deny/modify/timeout/多个 Hook 优先级 |
 | 子 Agent 跨 run 持久化 | `core/subagent/registry.py`、`core/subagent/tool.py`、`core/runner.py`、`core/app.py`、`core/run_manager.py` | 新增 `core/subagent/store.py` | 当前已支持在线查询/取消和级联清理；待补重启恢复、并发配额和历史索引 |
 | Parallel Tool Scheduler | `core/loop.py`、`core/tools/base.py`、`core/tools/invocation.py` | 新增 `core/tools/scheduler.py` | 只读并行、写入串行、依赖失败、取消传播 |
@@ -1200,7 +1240,7 @@ SearchCode、Session 崩溃恢复和 Verification Parser 已有可复现结果�
 - 仅当新旧 Python AST 能匹配同一函数/方法、签名和装饰器未变、修改行位于函数体时按 import 绑定缩小 pytest node；类属性、模块变量、签名/装饰器/继承、重命名、删除、解析失败等保留静态文件选择或全量回退；
 - 同一测试文件中 `result`/`other` 的定向回归验证已从文件级选择缩小为 `tests/test_service.py::test_result`；四项目语义 smoke 仍 4/4 完整复现失败，当前固定样本多为高风险核心变化，因此没有冒险宣称端到端加速。
 
-### 2026-09-17：可复现 Agent Evaluation Harness
+### 2026-09-17：可复现 Agent Evaluator
 
 - 新增 `kama eval` 和 JSON suite 契约，将真实 Agent 执行、外部 oracle、指标采集和证据留存统一成标准评测生命周期；
 - 每次任务解析并记录固定 commit，在独立 detached worktree 中运行，Agent 写入不会修改原工作区；任务结束、失败或超时后自动清理，支持显式保留现场；
@@ -1210,6 +1250,52 @@ SearchCode、Session 崩溃恢复和 Verification Parser 已有可复现结果�
 - 评测 artifacts 独立于 Session 根目录，不污染 `/resume`；关闭用户级 context 注入，保留版本库内项目 context；
 - 主要实现：`core/harness/{models,metrics,evaluation}.py`、`cli/commands/eval.py`、`core/runner.py`；示例为 `examples/evaluation_suite.example.json`；
 - 定向回归覆盖仓库隔离、oracle、patch、指标、超时和 worktree 清理；当前尚未运行真实模型任务矩阵，因此不填写成功率或性能提升数据。
+
+### 2026-09-18：Docker Execution Sandbox MVP
+
+日期：2026-09-18
+
+问题：Bash 与项目验证直接运行在 daemon 宿主机，只靠权限审批和 cwd 约束，无法强制限制绝对路径访问、网络、权限和资源。
+
+Baseline：本地子进程具备超时与有界输出，但 Agent 命令继承宿主环境和文件系统可见性。
+
+设计：引入 `ExecutionBackend` 协议，保留默认 Local 后端，并用一次性 Docker 容器实现可配置后端；工作区直接读写挂载以维持现有工具语义，`.git`、环境目录和敏感文件通过嵌套空挂载遮蔽；安全参数由 Runtime 固定，不接受模型输入。
+
+关键实现：Local/Docker 后端、严格 TOML/环境变量配置、根/子 Agent 后端传播、Bash/Verification 统一接线、离线基础镜像和可选项目工具镜像。
+
+相关文件：`src/kama_claude/core/sandbox/`、`src/kama_claude/core/config.py`、`src/kama_claude/core/runner.py`、`src/kama_claude/core/subagent/tool.py`、`src/kama_claude/core/tools/builtin/bash.py`、`src/kama_claude/core/verification/`、`docker/sandbox/`。
+
+测试：`tests/unit/test_sandbox.py`、`tests/unit/test_config_env.py`、`tests/integration/test_sandbox_docker.py`；扩展后全量单元测试为 460 passed、1 skipped，非实时模型集成为 13 passed、4 skipped，真实 Docker 集成为 4 passed。
+
+Benchmark：本轮目标是安全正确性，没有执行性能 benchmark，不填写性能提升。
+
+结果：真实 Docker Engine 已验证敏感文件不可见、容器 UID 10001、工作区可写、外网不可达、根文件系统不可写、超时容器无残留。
+
+限制与下一步：基础镜像只含 Python 标准库；项目依赖需在联网环境构建项目镜像或使用自定义镜像。继续补镜像 digest/供应链校验、只读源码层与输出层、网络 allowlist/审计、磁盘配额和远程 sandbox provider。
+
+简历表述：为 Coding Agent 设计可替换命令执行层，将 Bash 与自动验证统一迁移到一次性 Docker sandbox，并落地默认断网、只读根、非 root、capability 降权、资源配额、敏感路径遮蔽、超时清理及真实 Docker 集成测试。
+
+### 2026-09-18：Sandbox 环境感知与 Evaluator 行为评测
+
+日期：2026-09-18
+
+问题：Agent 只能从命令错误猜测宿主与 Sandbox 差异，容易把缺依赖等环境问题误当成源码缺陷；原 Evaluator 只能判定最终 patch/oracle，不能评测 Agent 是否正确查询环境或避免误改代码。
+
+设计：生产 AgentHarness 启动时自动注入紧凑环境摘要，提供脱敏只读 `sandbox_info`，并以确定性错误证据控制环境提示；Evaluator 将 Agent Sandbox 与可信 Oracle 分离，基于事件流评分工具选择、调用次数、源码修改和最终诊断。
+
+关键实现：`AgentHarness`、`SandboxInspector`、环境输入指纹和镜像标签、运行时探针、`SandboxInfoTool`、Bash/Verification failure advisor、Evaluator sandbox/expectations/score、per-tool metrics、`tool_trace.json`、`score.json`、`--validate-only`。
+
+相关文件：`src/kama_claude/core/sandbox/info.py`、`diagnostics.py`、`core/tools/builtin/sandbox_info.py`、`core/harness/`、`cli/commands/eval.py`、`EVALUATION_HARNESS.md`、`examples/sandbox_diagnosis_suite.example.json`。
+
+测试：确定性 Evaluator 通过真实 AgentHarness、worktree、EventBus、Oracle 和 artifact 全链路验证 Sandbox 决策评分；真实 Docker 验证 Windows host/Linux container 差异、UID、镜像元数据及 unknown drift 语义。
+
+Benchmark：尚未运行真实模型矩阵，不填写 Environment Precision/Recall 或 Token 改善；示例 suite 只作为首批正负对照契约。
+
+结果：Runtime 能在不暴露宿主变量的前提下向 Agent 提供环境证据；行为评分失败会令评测任务和 CLI 失败，可直接用于后续 CI 质量门禁。
+
+限制与下一步：运行至少 20 个真实模型环境/代码对照任务，扩展多个语言镜像和 held-out 场景，再根据 artifact 计算 Precision、Recall、误调用率、错误改码率和恢复率；重建仍保持人工审批，不向 Agent 暴露 Docker socket。
+
+简历表述：为容器化 Coding Agent 构建可观测环境感知与离线行为评测闭环，通过安全运行时探针、依赖指纹漂移、证据驱动诊断提示和独立 Oracle 量化环境识别与误改代码风险。
 
 ## 10. 后续更新规则
 
@@ -1250,3 +1336,5 @@ Benchmark：
 6. 为 checkpoint 增加 list/show UI、保留期限、分支 worktree 清理和容量配额；
 7. 为 `search_code` 增加搜索前后文和单行多命中；
 8. 增加结构化 Git log，以及可视化 Session 消息树/node/checkpoint 关联查询与历史节点选择器。
+9. 固定 Sandbox 镜像 digest，增加磁盘配额、网络 allowlist/审计，并把源码只读层与受控输出层分离。
+10. 用真实模型重复运行 Sandbox 正负对照 suite，形成 Environment Precision/Recall、误调用率、错误改码率和恢复率基线。

@@ -14,11 +14,17 @@ from kama_claude.core.bus.events import (
     SubagentFinishedEvent,
     SubagentStartedEvent,
 )
+from kama_claude.core.config import ExecutionConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.runs import new_run_id
+from kama_claude.core.sandbox import (
+    ExecutionBackend,
+    LocalExecutionBackend,
+    sandbox_system_prompt,
+)
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.builtin.bash import BashTool
@@ -27,6 +33,7 @@ from kama_claude.core.tools.builtin.git_diff import GitDiffTool
 from kama_claude.core.tools.builtin.git_status import GitStatusTool
 from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.read_file import ReadFileTool
+from kama_claude.core.tools.builtin.sandbox_info import SandboxInfoTool
 from kama_claude.core.tools.builtin.search_code import SearchCodeTool
 from kama_claude.core.tools.builtin.task_create import TaskCreateTool
 from kama_claude.core.tools.builtin.task_get import TaskGetTool
@@ -111,6 +118,8 @@ class SpawnAgentTool(BaseTool):
         verification_max_attempts: int = 3,
         verification_max_total_seconds: float = 600.0,
         run_manager: RunManager | None = None,
+        execution_backend: ExecutionBackend | None = None,
+        execution_config: ExecutionConfig | None = None,
     ) -> None:
         self._provider = provider
         self._parent_bus = parent_bus
@@ -127,6 +136,8 @@ class SpawnAgentTool(BaseTool):
         self._verification_max_attempts = verification_max_attempts
         self._verification_max_total_seconds = verification_max_total_seconds
         self._run_manager = run_manager
+        self._execution_backend = execution_backend or LocalExecutionBackend()
+        self._execution_config = execution_config or ExecutionConfig()
 
     # 派生子 agent，前台时阻塞直到完成并返回结果，后台时立即返回 run_id
     async def invoke(self, params: dict[str, object]) -> ToolResult:
@@ -149,6 +160,10 @@ class SpawnAgentTool(BaseTool):
             goal=p.prompt,
             max_steps=self._max_steps,
             system_prompt_override=profile.system_prompt if profile else None,
+            runtime_context=sandbox_system_prompt(
+                self._execution_config,
+                self._workspace_root,
+            ),
         )
 
         child_bus = EventBus()
@@ -298,9 +313,22 @@ class SpawnAgentTool(BaseTool):
             ),
             GitStatusTool(workspace_root=self._workspace_root),
             GitDiffTool(workspace_root=self._workspace_root),
-            VerifyProjectTool(workspace_root=self._workspace_root),
+            VerifyProjectTool(
+                workspace_root=self._workspace_root,
+                execution_backend=self._execution_backend,
+                ignore_files=self._ignore_files,
+            ),
+            SandboxInfoTool(
+                self._execution_config,
+                self._execution_backend,
+                self._workspace_root,
+            ),
             EditFileTool(workspace_root=self._workspace_root),
-            BashTool(workspace_root=self._workspace_root),
+            BashTool(
+                workspace_root=self._workspace_root,
+                execution_backend=self._execution_backend,
+                ignore_files=self._ignore_files,
+            ),
             WriteFileTool(workspace_root=self._workspace_root),
             ListDirTool(workspace_root=self._workspace_root),
         ]
@@ -335,6 +363,8 @@ class SpawnAgentTool(BaseTool):
                 verification_max_attempts=self._verification_max_attempts,
                 verification_max_total_seconds=self._verification_max_total_seconds,
                 run_manager=self._run_manager,
+                execution_backend=self._execution_backend,
+                execution_config=self._execution_config,
             )
             if _allowed("spawn_agent"):
                 registry.register(nested)

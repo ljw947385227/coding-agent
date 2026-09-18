@@ -14,6 +14,7 @@ class ExecutionContext:
     session_notes: str = ""
     global_context: str = ""
     project_context: str = ""
+    runtime_context: str = ""
     messages: list[dict[str, Any]] = field(default_factory=list)
     step: int = 0
     status: str = "running"  # "running" | "success" | "failed"
@@ -45,6 +46,8 @@ class ExecutionContext:
             parts.append("\n\n## Global Context\n" + self.global_context.strip())
         if self.project_context.strip():
             parts.append("\n\n## Project Context\n" + self.project_context.strip())
+        if self.runtime_context.strip():
+            parts.append(self.runtime_context)
         if self.session_notes.strip():
             parts.append(
                 "\n\n## Session Notes\n"

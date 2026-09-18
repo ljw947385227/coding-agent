@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import asyncio
-import os
-import signal
-import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from kama_claude.core.sandbox import ExecutionBackend, ExecutionRequest, LocalExecutionBackend
+from kama_claude.core.sandbox.diagnostics import sandbox_failure_hint
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.workspace import WorkspaceBoundary
 
@@ -45,91 +44,65 @@ class BashTool(BaseTool):
     }
 
     # 创建固定在会话工作区执行命令的终端工具
-    def __init__(self, *, workspace_root: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        workspace_root: str | Path | None = None,
+        execution_backend: ExecutionBackend | None = None,
+        ignore_files: Sequence[str] | None = None,
+    ) -> None:
         self._workspace = WorkspaceBoundary.from_path(workspace_root or Path.cwd())
+        self._execution_backend = execution_backend or LocalExecutionBackend()
+        self._ignore_files = tuple(ignore_files or ())
 
     # 在子进程中执行 shell 命令，合并 stdout/stderr，超时或非零退出码时返回错误
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = BashParams.model_validate(params)
-        command = p.command
-        timeout = p.timeout
-
         try:
-            if os.name == "nt":
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    cwd=self._workspace.root,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            result = await self._execution_backend.run(
+                ExecutionRequest(
+                    shell_command=p.command,
+                    workspace=self._workspace.root,
+                    timeout_seconds=float(p.timeout),
+                    max_output_bytes=_MAX_OUTPUT_BYTES,
+                    environment={"PYTHONDONTWRITEBYTECODE": "1"},
+                    sensitive_patterns=self._ignore_files,
                 )
-            else:
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    cwd=self._workspace.root,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    start_new_session=True,
-                )
-            try:
-                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except TimeoutError:
-                await _stop_process_tree(proc)
-                return ToolResult(
-                    content=f"[timeout after {timeout}s]",
-                    is_error=True,
-                    error_type="timeout",
-                )
-            except asyncio.CancelledError:
-                await _stop_process_tree(proc)
-                raise
+            )
         except Exception as exc:
             return ToolResult(content=str(exc), is_error=True, error_type="runtime_error")
-
-        output = stdout_bytes.decode("utf-8", errors="replace")
-        truncated = len(stdout_bytes) > _MAX_OUTPUT_BYTES
-        if truncated:
-            output = output[:_MAX_OUTPUT_BYTES] + "\n[truncated]"
-
-        returncode = proc.returncode or 0
-        if returncode != 0:
+        hint = sandbox_failure_hint(result)
+        output = result.output
+        if hint is not None:
+            output = f"{output}\n\n[environment hint] {hint}".strip()
+        if result.timed_out:
             return ToolResult(
-                content=f"[exit {returncode}]\n{output}",
+                content=f"[timeout after {p.timeout}s]\n{output}".rstrip(),
+                is_error=True,
+                error_type="timeout",
+            )
+        if result.launch_error is not None:
+            return ToolResult(
+                content=output or result.launch_error,
+                is_error=True,
+                error_type="runtime_error",
+            )
+        if result.oom_killed:
+            return ToolResult(
+                content=f"[sandbox out of memory]\n{output}".rstrip(),
+                is_error=True,
+                error_type="runtime_error",
+            )
+        if result.exit_code != 0:
+            return ToolResult(
+                content=f"[exit {result.exit_code}]\n{output}".rstrip(),
+                is_error=True,
+                error_type="runtime_error",
+            )
+        if result.cleanup_error is not None:
+            return ToolResult(
+                content=f"{output}\n[sandbox cleanup error] {result.cleanup_error}".strip(),
                 is_error=True,
                 error_type="runtime_error",
             )
         return ToolResult(content=output or "[no output]")
-
-
-# 取消或超时时终止 shell 及其派生的 Git/LFS/测试进程，避免服务器遗留孤儿任务
-async def _stop_process_tree(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
-        return
-    try:
-        if os.name == "nt":
-            killer = await asyncio.create_subprocess_exec(
-                "taskkill",
-                "/PID",
-                str(process.pid),
-                "/T",
-                "/F",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(killer.wait(), timeout=3.0)
-        else:
-            killpg = getattr(os, "killpg")
-            killpg(process.pid, signal.SIGTERM)
-        await asyncio.wait_for(process.wait(), timeout=1.0)
-    except ProcessLookupError:
-        return
-    except TimeoutError:
-        if os.name != "nt":
-            try:
-                killpg = getattr(os, "killpg")
-                killpg(process.pid, getattr(signal, "SIGKILL", 9))
-            except ProcessLookupError:
-                pass
-        elif process.returncode is None:
-            process.kill()
-        await process.wait()
