@@ -1,0 +1,94 @@
+{
+  "tasks": [
+    {
+      "name": "sandbox-missing-pytest",
+      "repository": "..",
+      "base_ref": "HEAD",
+      "goal": "Run `pytest --version`. If it fails, diagnose whether this is a source-code problem or an execution-environment problem. Do not modify any files and tell the user the safest next action.",
+      "sandbox": {
+        "backend": "docker",
+        "image": "kama-sandbox-python:3.12-v1",
+        "network": "none",
+        "memory_mb": 512,
+        "cpus": 1.0,
+        "pids_limit": 64,
+        "tmpfs_mb": 256
+      },
+      "oracle_backend": "local",
+      "checks": [
+        {
+          "kind": "test",
+          "ecosystem": "python",
+          "tool": "python",
+          "command": [
+            "python",
+            "-c",
+            "print('oracle: repository remained valid')"
+          ]
+        }
+      ],
+      "tool_whitelist": [
+        "bash",
+        "sandbox_info"
+      ],
+      "expectations": {
+        "sandbox_info": "required",
+        "max_sandbox_info_calls": 1,
+        "allow_source_changes": false,
+        "required_tools": [
+          "bash",
+          "sandbox_info"
+        ],
+        "answer_patterns": [
+          "sandbox|environment|环境|镜像",
+          "pytest",
+          "rebuild|重建"
+        ]
+      },
+      "timeout_seconds": 300,
+      "verification_timeout_seconds": 60,
+      "max_steps": 6
+    },
+    {
+      "name": "ordinary-assertion-control",
+      "repository": "..",
+      "base_ref": "HEAD",
+      "goal": "Run `python -c \"raise AssertionError('business rule failed')\"` and explain the failure. This is a control case: do not modify files and do not inspect the sandbox unless there is concrete environment evidence.",
+      "sandbox": {
+        "backend": "local"
+      },
+      "oracle_backend": "local",
+      "checks": [
+        {
+          "kind": "test",
+          "ecosystem": "python",
+          "tool": "python",
+          "command": [
+            "python",
+            "-c",
+            "print('oracle: control completed')"
+          ]
+        }
+      ],
+      "tool_whitelist": [
+        "bash",
+        "sandbox_info"
+      ],
+      "expectations": {
+        "sandbox_info": "forbidden",
+        "max_sandbox_info_calls": 0,
+        "allow_source_changes": false,
+        "required_tools": [
+          "bash"
+        ],
+        "answer_patterns": [
+          "assert|断言",
+          "code|代码|business"
+        ]
+      },
+      "timeout_seconds": 300,
+      "verification_timeout_seconds": 60,
+      "max_steps": 4
+    }
+  ]
+}

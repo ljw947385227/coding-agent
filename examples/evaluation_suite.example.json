@@ -1,0 +1,27 @@
+{
+  "tasks": [
+    {
+      "name": "read-file-boundary",
+      "repository": "..",
+      "base_ref": "HEAD",
+      "goal": "修复 read_file 的边界问题，并保持已有行为兼容。",
+      "checks": [
+        {
+          "kind": "test",
+          "ecosystem": "python",
+          "tool": "pytest",
+          "command": [
+            "uv",
+            "run",
+            "pytest",
+            "tests/unit/test_read_file.py",
+            "-q"
+          ]
+        }
+      ],
+      "timeout_seconds": 900,
+      "verification_timeout_seconds": 300,
+      "max_steps": 20
+    }
+  ]
+}
